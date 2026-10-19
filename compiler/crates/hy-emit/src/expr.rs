@@ -127,11 +127,17 @@ impl Emitter {
                     ));
                 }
                 let (head, type_args) = split_type_args(name);
+                let go_head =
+                    if self.local_vars.contains(head) || self.user_top_values.contains(head) {
+                        super::mangle_reserved_ident(head)
+                    } else {
+                        head.to_string()
+                    };
                 if let Some(ta) = type_args {
                     let translated = self.translate_type_args_suffix(ta);
-                    return Ok(format!("{}{}", head, translated));
+                    return Ok(format!("{}{}", go_head, translated));
                 }
-                Ok(name.clone())
+                Ok(go_head)
             }
 
             Expr::Lit { kind, .. } => Ok(self.lit_text(kind)),
@@ -329,7 +335,13 @@ impl Emitter {
                     };
                 let rendered_params = params
                     .iter()
-                    .map(|p| format!("{} {}", p.name, self.type_text(&p.ty)))
+                    .map(|p| {
+                        format!(
+                            "{} {}",
+                            super::mangle_reserved_ident(&p.name),
+                            self.type_text(&p.ty)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 // Hints from closure param types (example-06's w, r) —
@@ -380,7 +392,7 @@ impl Emitter {
                         .first()
                         .map(|p| p.name.clone())
                         .unwrap_or_else(|| w.to_string());
-                    self.handler_writer = Some(name);
+                    self.handler_writer = Some(super::mangle_reserved_ident(&name));
                 }
                 self.fnlit_depth += 1;
                 // Labels do not cross func boundaries: a labeled break/continue
@@ -399,7 +411,13 @@ impl Emitter {
                     let rs = results
                         .iter()
                         .map(|r| match &r.name {
-                            Some(n) => format!("{} {}", n, self.type_text(&r.ty)),
+                            Some(n) => {
+                                format!(
+                                    "{} {}",
+                                    super::mangle_reserved_ident(n),
+                                    self.type_text(&r.ty)
+                                )
+                            }
                             None => self.type_text(&r.ty),
                         })
                         .collect::<Vec<_>>()
@@ -688,12 +706,19 @@ impl Emitter {
         args: &[CallArg],
     ) -> Result<String, EmitError> {
         // --- make(...): the first argument is a TYPE (bug-#2 fix) ---
-        if matches!(callee, Expr::Ident { name, .. } if name == "make") {
+        if matches!(callee, Expr::Ident { name, .. } if name == "make")
+            && !self.local_vars.contains("make")
+            && !self.user_top_values.contains("make")
+        {
             return self.emit_make(args);
         }
         // --- new(T) whose zero value allocates maps (N5, issue #645) ---
         let is_new = matches!(callee, Expr::Ident { name, .. } if name == "new");
-        if is_new && !self.local_vars.contains("new") && !self.fn_shapes.contains_key("new") {
+        if is_new
+            && !self.local_vars.contains("new")
+            && !self.user_top_values.contains("new")
+            && !self.fn_shapes.contains_key("new")
+        {
             if let Some(alloc) = self.n5_new(args) {
                 return Ok(alloc);
             }
@@ -708,7 +733,10 @@ impl Emitter {
                 // package root, so its call used to fall through this whole
                 // block, emit verbatim, and die in the toolchain with
                 // `undefined: flate2`.
-                if !self.local_vars.contains(pkg) && lookup_unbound_crate(pkg).is_some() {
+                if !self.local_vars.contains(pkg)
+                    && !self.user_top_values.contains(pkg)
+                    && lookup_unbound_crate(pkg).is_some()
+                {
                     return Err(EmitError::unbound_crate(pkg));
                 }
                 if self.is_unshadowed_pkg_root(pkg) {
@@ -798,10 +826,17 @@ impl Emitter {
         while let Expr::Paren { inner, .. } = bare_callee {
             bare_callee = inner;
         }
-        if matches!(bare_callee, Expr::Ident { name, .. } if name == "make") {
+        if matches!(bare_callee, Expr::Ident { name, .. } if name == "make")
+            && !self.local_vars.contains("make")
+            && !self.user_top_values.contains("make")
+        {
             return self.emit_make(args);
         }
-        if matches!(bare_callee, Expr::Ident { name, .. } if name == "new") && args.len() == 1 {
+        if matches!(bare_callee, Expr::Ident { name, .. } if name == "new")
+            && args.len() == 1
+            && !self.local_vars.contains("new")
+            && !self.user_top_values.contains("new")
+        {
             return self.emit_new(&args[0]);
         }
 
@@ -811,33 +846,35 @@ impl Emitter {
         //     name used to fall through to the verbatim emission below and
         //     die in Go as `undefined: u8`. Issue #147. ---
         if let Expr::Ident { name, .. } = callee {
-            if let Some(go) = super::shapes::go_primitive_name(name) {
-                if args.len() != 1 {
-                    return Err(EmitError::unsupported(format!(
-                        "`{}` conversion takes exactly one argument",
-                        name
-                    )));
+            if !self.local_vars.contains(name) && !self.user_top_values.contains(name) {
+                if let Some(go) = super::shapes::go_primitive_name(name) {
+                    if args.len() != 1 {
+                        return Err(EmitError::unsupported(format!(
+                            "`{}` conversion takes exactly one argument",
+                            name
+                        )));
+                    }
+                    // A CONSTANT operand that does not fit the target has to
+                    // be folded here: Go rejects `uint8(300)` outright (the
+                    // truncation Go does is only for a variable operand), yet
+                    // SPEC-LANGUAGE line 1991 asserts `u8(300) == 44` as an
+                    // executable test-claim. The fold computes that same
+                    // two's-complement truncation at emit time.
+                    if let Some(folded) = super::constconv::fold_constant(&args[0].value, name) {
+                        return Ok(format!("{}({})", go, folded));
+                    }
+                    let a = self.emit_call_arg(&args[0])?;
+                    return Ok(format!("{}({})", go, a));
                 }
-                // A CONSTANT operand that does not fit the target has to
-                // be folded here: Go rejects `uint8(300)` outright (the
-                // truncation Go does is only for a variable operand), yet
-                // SPEC-LANGUAGE line 1991 asserts `u8(300) == 44` as an
-                // executable test-claim. The fold computes that same
-                // two's-complement truncation at emit time.
-                if let Some(folded) = super::constconv::fold_constant(&args[0].value, name) {
-                    return Ok(format!("{}({})", go, folded));
+                if name == "len" && args.len() == 1 && self.is_set_expr(&args[0].value) {
+                    let a = self.emit_call_arg(&args[0])?;
+                    return Ok(format!("{}.len()", a));
                 }
-                let a = self.emit_call_arg(&args[0])?;
-                return Ok(format!("{}({})", go, a));
-            }
-            if name == "len" && args.len() == 1 && self.is_set_expr(&args[0].value) {
-                let a = self.emit_call_arg(&args[0])?;
-                return Ok(format!("{}.len()", a));
-            }
-            if name == "delete" && args.len() == 2 && self.is_set_expr(&args[0].value) {
-                let s = self.emit_call_arg(&args[0])?;
-                let v = self.emit_call_arg(&args[1])?;
-                return Ok(format!("{}.remove({})", s, v));
+                if name == "delete" && args.len() == 2 && self.is_set_expr(&args[0].value) {
+                    let s = self.emit_call_arg(&args[0])?;
+                    let v = self.emit_call_arg(&args[1])?;
+                    return Ok(format!("{}.remove({})", s, v));
+                }
             }
         }
 
@@ -938,7 +975,7 @@ impl Emitter {
             } if entries.is_empty() => {
                 format!("map[{}]{}", self.type_text(key), self.type_text(value))
             }
-            Expr::Ident { name, .. } => name.clone(),
+            Expr::Ident { name, .. } => self.go_type_name(name),
             other => {
                 return Err(EmitError::unsupported(format!(
                     "`make` first argument must be a type; got value `{}`",
@@ -975,9 +1012,7 @@ impl Emitter {
                 entries,
                 ..
             } if entries.is_empty() => format!("map[{}]{}", self.type_text(key), self.type_text(value)),
-            Expr::Ident { name, .. } => super::shapes::go_primitive_name(name)
-                .unwrap_or(name.as_str())
-                .to_string(),
+            Expr::Ident { name, .. } => self.go_type_name(name),
             other => self.emit_expr(other, 0)?,
         };
         Ok(format!("new({})", ty_text))
