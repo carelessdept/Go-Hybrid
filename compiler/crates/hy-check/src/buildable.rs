@@ -90,6 +90,11 @@ pub(crate) enum OpKind {
     /// declaration is out of reach). The count is what closes the
     /// closure/method-value arity bypass (#577 C9).
     Fn(Vec<OpKind>, Option<usize>),
+    /// A generic type parameter in scope (`[t any]` or `[t comparable]`, #729).
+    TypeParam {
+        name: String,
+        comparable: bool,
+    },
     Void,
 }
 
@@ -114,6 +119,7 @@ impl OpKind {
             OpKind::Struct(None) => "struct".to_string(),
             OpKind::Pointer(inner) => format!("*{}", inner.label()),
             OpKind::Fn(..) => "fn".to_string(),
+            OpKind::TypeParam { name, .. } => format!("type parameter {}", name),
             OpKind::Void => "void".to_string(),
         }
     }
@@ -149,10 +155,6 @@ fn kinds_conflict(want: &OpKind, got: &OpKind) -> bool {
         (Interface, _) | (_, Interface) => false,
         // No value is involved; a count check owns that case.
         (Void, _) | (_, Void) => false,
-        // An untyped int constant is assignable to a float target
-        // (`var f float64 = 1` builds). The kind model cannot tell an untyped
-        // constant from an `int` variable, so this direction must stay allowed
-        // or the check would reject buildable programs.
         // An untyped int constant is assignable to a float result
         // (`fn f() float64 { return 1 }` builds). The kind model cannot tell
         // an untyped constant from an `int` variable, so this direction must
@@ -160,6 +162,7 @@ fn kinds_conflict(want: &OpKind, got: &OpKind) -> bool {
         (Float, Int) => false,
         // A struct whose name did not resolve is not evidence of a mismatch.
         (Struct(None), _) | (_, Struct(None)) => false,
+        (TypeParam { name: a, .. }, TypeParam { name: b, .. }) => a != b,
         (a, b) if a == b => false,
         // Same container shape: recurse into the element kinds.
         (Slice(a), Slice(b)) | (Array(a), Array(b)) | (Chan(a), Chan(b)) => {
@@ -284,6 +287,7 @@ fn is_fully_resolved(k: &OpKind) -> bool {
         // claim absence — same fail-open as `kinds_conflict`'s Interface arm.
         OpKind::Interface => false,
         OpKind::Int | OpKind::Float | OpKind::Bool | OpKind::Str => true,
+        OpKind::TypeParam { .. } => true,
         OpKind::Void => false,
         // A struct whose NAME did not resolve cannot have its members looked up.
         OpKind::Struct(None) => false,
@@ -360,6 +364,8 @@ struct Collector<'a> {
     kind_scopes: Vec<HashMap<String, OpKind>>,
     /// File-level `const` kinds (#425).
     file_consts: HashMap<String, OpKind>,
+    /// Active function type parameters (`name -> comparable`, #729).
+    fn_type_params: HashMap<String, bool>,
     /// Result kinds of the function whose body is currently being walked
     /// (#577 C9/C10). Empty for a fn declared with no results — which is also
     /// the state outside any body, so `Stmt::Return` can only ever see it
@@ -395,6 +401,7 @@ pub(crate) fn check_buildable(ck: &mut Checker<'_>) {
             scopes: Vec::new(),
             kind_scopes: Vec::new(),
             file_consts: HashMap::new(),
+            fn_type_params: HashMap::new(),
             fn_results: Vec::new(),
             fn_results_all_named: false,
             fn_results_error_tail: false,
@@ -423,9 +430,16 @@ pub(crate) fn check_buildable(ck: &mut Checker<'_>) {
                     c.expr(&cd.value);
                 }
                 Decl::Struct(s) => {
+                    let st_tparams = effective_type_param_map(
+                        &s.type_params,
+                        s.fields.iter().map(|f| &f.ty),
+                        None,
+                    );
+                    let outer = std::mem::replace(&mut c.fn_type_params, st_tparams);
                     for f in &s.fields {
                         c.ty(&f.ty);
                     }
+                    c.fn_type_params = outer;
                 }
                 Decl::Enum(e) => {
                     for v in &e.variants {
@@ -489,25 +503,24 @@ impl<'a> Collector<'a> {
     /// (`v = ...`) without ever reading it, the emitter must keep the binding
     /// and Go rejects it as `declared and not used`.
     fn define_elidable(&mut self, name: &str, span: Span) {
-        if name == "_" {
-            return;
+        if name != "_" {
+            let Some(top) = self.scopes.last_mut() else {
+                return;
+            };
+            if top.contains_key(name) {
+                return;
+            }
+            let id = self.defines.len();
+            self.defines.push(Define {
+                name: name.to_string(),
+                span,
+                kind: LocalKind::Define,
+                used: false,
+                written: false,
+                elidable: true,
+            });
+            top.insert(name.to_string(), Some(id));
         }
-        let Some(top) = self.scopes.last_mut() else {
-            return;
-        };
-        if top.contains_key(name) {
-            return;
-        }
-        let id = self.defines.len();
-        self.defines.push(Define {
-            name: name.to_string(),
-            span,
-            kind: LocalKind::Define,
-            used: false,
-            written: false,
-            elidable: true,
-        });
-        top.insert(name.to_string(), Some(id));
     }
 
     /// Every identifier mention not shadowed by a local or parameter binding
@@ -631,6 +644,46 @@ impl<'a> Collector<'a> {
     // -- declarations --------------------------------------------------------
 
     fn fn_decl(&mut self, f: &FnDecl) {
+        let mut fn_tparams = effective_type_param_map(
+            &f.type_params,
+            f.params
+                .iter()
+                .map(|p| &p.ty)
+                .chain(f.results.iter().map(|r| &r.ty)),
+            f.body.as_ref(),
+        );
+        if fn_tparams.is_empty() {
+            if let Some(r) = &f.receiver {
+                if let TypeExpr::Named { name, .. } = &r.ty {
+                    if let Some(open) = name.find('[') {
+                        if name.ends_with(']') {
+                            let base = &name[..open];
+                            let inner = &name[open + 1..name.len() - 1];
+                            if let Some(st_tparams) = self.ck.struct_type_params.get(base) {
+                                let st_fields = self.ck.structs.get(base);
+                                let st_map = effective_type_param_map(
+                                    st_tparams,
+                                    st_fields
+                                        .into_iter()
+                                        .flat_map(|fs| fs.iter().map(|(_, ty)| ty)),
+                                    None,
+                                );
+                                let args = split_top_level_type_args(inner);
+                                if args.len() == st_tparams.len() {
+                                    for (tp, arg) in st_tparams.iter().zip(args) {
+                                        if matches!(self.kind_of_named(arg, 0), OpKind::Unknown) {
+                                            let comp = st_map.get(&tp.name).copied().unwrap_or(false);
+                                            fn_tparams.insert(arg.to_string(), comp);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let outer_tparams = std::mem::replace(&mut self.fn_type_params, fn_tparams);
         if let Some(r) = &f.receiver {
             self.ty(&r.ty);
         }
@@ -650,7 +703,10 @@ impl<'a> Collector<'a> {
             f.results.last().map(|r| &r.ty),
             Some(TypeExpr::Named { name, .. }) if name == "error"
         );
-        let Some(body) = &f.body else { return };
+        let Some(body) = &f.body else {
+            self.fn_type_params = outer_tparams;
+            return;
+        };
         self.push_scope();
         if let Some(r) = &f.receiver {
             self.exempt(&r.name);
@@ -690,6 +746,7 @@ impl<'a> Collector<'a> {
         self.fn_results = outer;
         self.fn_results_all_named = outer_named;
         self.fn_results_error_tail = outer_err;
+        self.fn_type_params = outer_tparams;
         self.pop_scope();
     }
 
@@ -1499,7 +1556,26 @@ impl<'a> Collector<'a> {
                 self.check_named_type_instantiation(arg, span);
             }
         }
-        if head == "set" || head == "option" || head == "map" {
+        if head == "set" {
+            if let Some(inner) = inner_opt {
+                let elem_kind = self.kind_of_type_str(inner.trim(), 0);
+                if let Some(reason) = self.incomparable_kind_reason(&elem_kind, 0) {
+                    self.emit_e2006(
+                        span,
+                        format!(
+                            "set element type `{}` in `{}` does not satisfy `comparable` ({}) — Go rejects `set[{}]` (HYB-E2006)",
+                            elem_kind.label(),
+                            name,
+                            reason,
+                            inner.trim()
+                        ),
+                        "a `set[T]` lowers to `map[T]struct{}` in Go, so `T` must satisfy `comparable`",
+                    );
+                }
+            }
+            return;
+        }
+        if head == "option" || head == "map" {
             return;
         }
         let Some(tparams) = self.ck.struct_type_params.get(head) else {
@@ -1528,7 +1604,8 @@ impl<'a> Collector<'a> {
                 );
             }
             (n, Some(inner)) if n > 0 => {
-                let got = split_top_level_type_args(inner).len();
+                let args = split_top_level_type_args(inner);
+                let got = args.len();
                 if got != n {
                     self.emit_e1002(
                         span,
@@ -1538,6 +1615,33 @@ impl<'a> Collector<'a> {
                         ),
                         "supply one type argument per declared type parameter on the struct",
                     );
+                } else {
+                    let st_fields = self.ck.structs.get(head);
+                    let comp_map = effective_type_param_map(
+                        tparams,
+                        st_fields
+                            .into_iter()
+                            .flat_map(|fs| fs.iter().map(|(_, ty)| ty)),
+                        None,
+                    );
+                    for (tp, raw_arg) in tparams.iter().zip(args) {
+                        if comp_map.get(&tp.name).copied().unwrap_or(false) {
+                            let arg_kind = self.kind_of_type_str(raw_arg, 0);
+                            if let Some(reason) = self.incomparable_kind_reason(&arg_kind, 0) {
+                                self.emit_e2006(
+                                    span,
+                                    format!(
+                                        "type argument `{}` for type parameter `{}` in `{}` does not satisfy `comparable` ({}) — Go rejects this instantiation (HYB-E2006)",
+                                        arg_kind.label(),
+                                        tp.name,
+                                        name,
+                                        reason
+                                    ),
+                                    "pass a comparable type argument (or constrain an outer type parameter with `comparable`)",
+                                );
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1584,6 +1688,12 @@ impl<'a> Collector<'a> {
             return OpKind::Unknown;
         }
         let name = name.trim();
+        if let Some(&comparable) = self.fn_type_params.get(name) {
+            return OpKind::TypeParam {
+                name: name.to_string(),
+                comparable,
+            };
+        }
         let base = Checker::base_named_type_str(name);
         if self.ck.structs.contains_key(base) || self.ck.struct_type_params.contains_key(base) {
             return OpKind::Struct(Some(name.to_string()));
@@ -1625,6 +1735,16 @@ impl<'a> Collector<'a> {
             .or_else(|| s.strip_prefix("chan "))
         {
             return OpKind::Chan(Box::new(self.kind_of_type_str(rest, depth + 1)));
+        }
+        if let Some(inner) = s.strip_prefix("map[") {
+            if let Some(close) = inner.find(']') {
+                let k_str = &inner[..close];
+                let v_str = &inner[close + 1..];
+                return OpKind::Map(
+                    Box::new(self.kind_of_type_str(k_str, depth + 1)),
+                    Box::new(self.kind_of_type_str(v_str, depth + 1)),
+                );
+            }
         }
         self.kind_of_named(s, depth)
     }
@@ -1941,7 +2061,10 @@ impl<'a> Collector<'a> {
                     _ => {}
                 }
                 let conv = self.kind_of_named(name, 0);
-                if !matches!(conv, OpKind::Unknown | OpKind::Struct(_)) {
+                if !matches!(
+                    conv,
+                    OpKind::Unknown | OpKind::Struct(_) | OpKind::TypeParam { .. }
+                ) {
                     return Some(vec![conv]);
                 }
                 let head = Checker::base_named_type_str(name);
@@ -2013,6 +2136,53 @@ impl<'a> Collector<'a> {
             Diagnostic::error("HYB-E2005", self.path.clone(), span, msg)
                 .with_notes(vec![note.to_string()]),
         );
+    }
+
+    fn emit_e2006(&mut self, span: Span, msg: String, note: &str) {
+        self.diags.push(
+            Diagnostic::error("HYB-E2006", self.path.clone(), span, msg)
+                .with_notes(vec![note.to_string()]),
+        );
+    }
+
+    /// Returns `Some(reason)` when `k` is provably NOT a comparable Go type
+    /// (`slice`, `map`, `func`, unconstrained `type parameter t`, or an array /
+    /// struct containing a non-comparable element/field).
+    fn incomparable_kind_reason(&self, k: &OpKind, depth: usize) -> Option<String> {
+        if depth > 8 {
+            return None;
+        }
+        match k {
+            OpKind::Slice(_) => Some("slices are not comparable in Go".to_string()),
+            OpKind::Map(_, _) => Some("maps are not comparable in Go".to_string()),
+            OpKind::Fn(..) => Some("functions are not comparable in Go".to_string()),
+            OpKind::TypeParam {
+                name,
+                comparable: false,
+            } => Some(format!(
+                "type parameter `{}` is not constrained by `comparable`",
+                name
+            )),
+            OpKind::Array(elem) => self
+                .incomparable_kind_reason(elem, depth + 1)
+                .map(|r| format!("array element is non-comparable ({})", r)),
+            OpKind::Struct(Some(full_name)) => {
+                let base_name = Checker::base_named_type_str(full_name);
+                let fields = self.ck.structs.get(base_name)?;
+                let subst = self.struct_type_arg_map(full_name);
+                for (fname, fty) in fields {
+                    let fk = self.kind_of_ty_with_subst(fty, &subst, depth + 1);
+                    if let Some(r) = self.incomparable_kind_reason(&fk, depth + 1) {
+                        return Some(format!(
+                            "struct `{}` has non-comparable field `{}` ({})",
+                            full_name, fname, r
+                        ));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     /// #682 U14/U15 — a struct literal may only name fields the struct
@@ -2105,6 +2275,19 @@ impl<'a> Collector<'a> {
     fn check_conversion_arity(&mut self, name: &str, args: &[CallArg], span: Span) {
         let k = self.kind_of_named(name, 0);
         if matches!(k, OpKind::Unknown) {
+            return;
+        }
+        if let OpKind::TypeParam { name: tp_name, .. } = k {
+            if !self.ck.fns.contains_key(name) {
+                self.emit_e1002(
+                    span,
+                    format!(
+                        "cannot convert to type parameter `{}` — Go type parameters constrained by `any` or `comparable` do not support type conversions (HYB-E1002)",
+                        tp_name
+                    ),
+                    "type parameters in SPEC G3 (`any` / `comparable`) have no underlying core type for `T(x)` conversions",
+                );
+            }
             return;
         }
         if args.len() != 1 {
@@ -2263,11 +2446,6 @@ impl<'a> Collector<'a> {
         let Some(f) = self.ck.fns.get(name).or_else(|| self.ck.fns.get(head)) else {
             return;
         };
-        // Generic instantiations (`id[int](x)`) carry type arguments the
-        // parameter list does not describe; leave them to the type checker.
-        if !f.type_params.is_empty() {
-            return;
-        }
         // A lone multi-value call IS the whole argument list and expands to one
         // argument per result: `g(two())` for a 2-param `g` is one written
         // argument but two effective ones, and it builds. #682 U7's
@@ -2810,6 +2988,46 @@ impl<'a> Collector<'a> {
 
     /// Family B3/B4/B5 (#425): binary operator operand-kind checks.
     fn check_binary_operands(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
+        if matches!(op, BinOp::Eq | BinOp::Ne) {
+            let lk = self.kind_of_expr(lhs);
+            let rk = self.kind_of_expr(rhs);
+            if matches!(lk, OpKind::TypeParam { .. }) || matches!(rk, OpKind::TypeParam { .. }) {
+                let op_str = if matches!(op, BinOp::Eq) { "==" } else { "!=" };
+                if let Some(reason) = self
+                    .incomparable_kind_reason(&lk, 0)
+                    .or_else(|| self.incomparable_kind_reason(&rk, 0))
+                {
+                    self.emit_e2006(
+                        span,
+                        format!(
+                            "invalid operation `{}`: `{}` on non-comparable {} (HYB-E2006)",
+                            span_expr_label(lhs, op_str, rhs),
+                            op_str,
+                            reason
+                        ),
+                        "constrain the type parameter with `comparable` (or omit `any` so the compiler infers `comparable`)",
+                    );
+                    return;
+                }
+                if !Checker::is_nil_literal(lhs)
+                    && !Checker::is_nil_literal(rhs)
+                    && kinds_conflict(&lk, &rk)
+                    && kinds_conflict(&rk, &lk)
+                {
+                    self.emit_e1002(
+                        span,
+                        format!(
+                            "invalid operation `{}` (mismatched types `{}` and `{}`) (HYB-E1002)",
+                            span_expr_label(lhs, op_str, rhs),
+                            lk.label(),
+                            rk.label()
+                        ),
+                        "both operands of `==` and `!=` must have identical or assignable types",
+                    );
+                }
+                return;
+            }
+        }
         // #682 U6: an operand must be exactly one value. `two() + 1` is Go's
         // `multiple-value two() (value of type (int, int)) in single-value
         // context`, and the kind inference below would otherwise take the
@@ -3762,6 +3980,7 @@ impl<'a> Collector<'a> {
                     }
                 } else {
                     self.check_fn_type_arg_arity(name, name, span);
+                    self.check_generic_fn_call(name, name, args, span);
                     self.check_builtin_operand_kinds(name, args, span);
                     self.check_conversion_arity(name, args, span);
                     // #682 U5: `append`'s appended values must be assignable
@@ -3793,6 +4012,7 @@ impl<'a> Collector<'a> {
                         let head = Checker::base_named_type_str(name);
                         let assoc_key = format!("{}.{}", pkg, head);
                         self.check_fn_type_arg_arity(&assoc_key, name, span);
+                        self.check_generic_fn_call(&assoc_key, name, args, span);
                     }
                 }
                 let bk = self.kind_of_expr(base);
@@ -3918,6 +4138,334 @@ impl<'a> Collector<'a> {
                 ),
                 "supply one type argument per declared type parameter on the function",
             );
+        }
+    }
+
+    /// Issue #729: validate generic function calls (`f(args)` and `f[T1, T2](args)`):
+    /// 1. Check explicit type arguments against `comparable` constraints (`HYB-E2006`).
+    /// 2. Infer/check type arguments from value arguments and reject conflicting
+    ///    argument types (`HYB-E1002`) or inferred non-comparable types (`HYB-E2006`).
+    /// 3. Reject calls where a return-only type parameter cannot be inferred (`HYB-E1002`).
+    fn check_generic_fn_call(
+        &mut self,
+        fn_key: &str,
+        raw_callee: &str,
+        args: &[CallArg],
+        span: Span,
+    ) {
+        let base_key = Checker::base_named_type_str(fn_key);
+        let Some(f) = self.ck.fns.get(base_key).cloned() else {
+            return;
+        };
+        if f.type_params.is_empty() {
+            return;
+        }
+        let param_comparable = effective_type_param_map(
+            &f.type_params,
+            f.params
+                .iter()
+                .map(|p| &p.ty)
+                .chain(f.results.iter().map(|r| &r.ty)),
+            f.body.as_ref(),
+        );
+
+        let explicit_type_args: Option<Vec<&str>> = raw_callee
+            .find('[')
+            .filter(|_| raw_callee.ends_with(']'))
+            .map(|open| split_top_level_type_args(&raw_callee[open + 1..raw_callee.len() - 1]));
+
+        if let Some(ref targs) = explicit_type_args {
+            if targs.len() != f.type_params.len() {
+                return;
+            }
+        }
+        if args.len() != f.params.len() {
+            return;
+        }
+
+        let mut subst_kinds: HashMap<String, OpKind> = HashMap::new();
+        let mut subst_strs: HashMap<String, String> = HashMap::new();
+
+        if let Some(ref targs) = explicit_type_args {
+            for (tp, targ) in f.type_params.iter().zip(targs.iter()) {
+                let kind = self.kind_of_type_str(targ, 0);
+                if param_comparable.get(&tp.name).copied().unwrap_or(false) {
+                    if let Some(reason) = self.incomparable_kind_reason(&kind, 0) {
+                        self.emit_e2006(
+                            span,
+                            format!(
+                                "type argument `{}` for `{}` in `{}` does not satisfy `comparable` ({} is not comparable) (HYB-E2006)",
+                                targ, tp.name, base_key, reason
+                            ),
+                            "choose a comparable type argument (`int`, `string`, pointers, arrays/structs of comparable fields) for `comparable`-constrained type parameters",
+                        );
+                    }
+                }
+                subst_kinds.insert(tp.name.clone(), kind);
+                subst_strs.insert(tp.name.clone(), (*targ).to_string());
+            }
+        }
+
+        for (param, arg) in f.params.iter().zip(args.iter()) {
+            let arg_kind = self.kind_of_expr(&arg.value);
+            if arg_kind == OpKind::Unknown || Checker::is_nil_literal(&arg.value) {
+                continue;
+            }
+            self.bind_type_params_from_arg(
+                &param.ty,
+                &arg_kind,
+                &arg.value,
+                &param_comparable,
+                &mut subst_kinds,
+                &mut subst_strs,
+                base_key,
+            );
+        }
+
+        // If no explicit type arguments were supplied, every declared type
+        // parameter must be bound by the value arguments (`make_zero[t]() t`
+        // called as `make_zero()` cannot infer `t` in Go).
+        if explicit_type_args.is_none() {
+            for tp in &f.type_params {
+                if !subst_kinds.contains_key(&tp.name) {
+                    self.emit_e1002(
+                        span,
+                        format!(
+                            "cannot infer type parameter `{}` in call to `{}` — pass explicit type arguments `{}[...](...)` (HYB-E1002)",
+                            tp.name, base_key, base_key
+                        ),
+                        "Go cannot infer a type parameter that does not appear in any value parameter; supply explicit `[T]` type arguments at the call site",
+                    );
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_type_params_from_arg(
+        &mut self,
+        param_ty: &TypeExpr,
+        arg_kind: &OpKind,
+        arg_expr: &Expr,
+        param_comparable: &HashMap<String, bool>,
+        subst_kinds: &mut HashMap<String, OpKind>,
+        subst_strs: &mut HashMap<String, String>,
+        fn_name: &str,
+    ) {
+        if *arg_kind == OpKind::Unknown {
+            return;
+        }
+        match param_ty {
+            TypeExpr::Named { name, .. } => {
+                if let Some(&is_comp) = param_comparable.get(name) {
+                    if let Some(existing) = subst_kinds.get(name).cloned() {
+                        if kinds_conflict(&existing, arg_kind)
+                            || kinds_conflict(arg_kind, &existing)
+                        {
+                            self.emit_e1002(
+                                arg_expr.span(),
+                                format!(
+                                    "cannot use `{}` (type `{}`) as `{}` (inferred `{}`) in argument to `{}` (HYB-E1002)",
+                                    arg_expr.render(),
+                                    arg_kind.label(),
+                                    name,
+                                    existing.label(),
+                                    fn_name
+                                ),
+                                "arguments corresponding to the same type parameter must have matching types",
+                            );
+                        }
+                    } else {
+                        if is_comp {
+                            if let Some(reason) = self.incomparable_kind_reason(arg_kind, 0) {
+                                self.emit_e2006(
+                                    arg_expr.span(),
+                                    format!(
+                                        "inferred type `{}` for `{}` in call to `{}` does not satisfy `comparable` ({} is not comparable) (HYB-E2006)",
+                                        arg_kind.label(),
+                                        name,
+                                        fn_name,
+                                        reason
+                                    ),
+                                    "pass a comparable argument type or relax the function's constraint",
+                                );
+                            }
+                        }
+                        subst_kinds.insert(name.clone(), arg_kind.clone());
+                        subst_strs.insert(name.clone(), arg_kind.label());
+                    }
+                    return;
+                }
+                if let Some(inner) = name.strip_prefix("set[").and_then(|s| s.strip_suffix(']')) {
+                    let elem_ty = TypeExpr::Named {
+                        name: inner.trim().to_string(),
+                        span: param_ty.span(),
+                    };
+                    if let OpKind::Map(k, _) = arg_kind {
+                        self.bind_type_params_from_arg(
+                            &elem_ty,
+                            k,
+                            arg_expr,
+                            param_comparable,
+                            subst_kinds,
+                            subst_strs,
+                            fn_name,
+                        );
+                        return;
+                    }
+                }
+                let expected = self.kind_of_ty_with_subst(param_ty, subst_strs, 0);
+                if kinds_conflict(&expected, arg_kind) {
+                    self.emit_e1002(
+                        arg_expr.span(),
+                        format!(
+                            "cannot use `{}` (type `{}`) as `{}` in argument to `{}` (HYB-E1002)",
+                            arg_expr.render(),
+                            arg_kind.label(),
+                            expected.label(),
+                            fn_name
+                        ),
+                        "pass an argument whose type matches the parameter type",
+                    );
+                }
+            }
+            TypeExpr::Slice { elem, .. } => {
+                if let OpKind::Slice(inner) = arg_kind {
+                    self.bind_type_params_from_arg(
+                        elem,
+                        inner,
+                        arg_expr,
+                        param_comparable,
+                        subst_kinds,
+                        subst_strs,
+                        fn_name,
+                    );
+                } else {
+                    let expected = self.kind_of_ty_with_subst(param_ty, subst_strs, 0);
+                    if kinds_conflict(&expected, arg_kind) {
+                        self.emit_e1002(
+                            arg_expr.span(),
+                            format!(
+                                "cannot use `{}` (type `{}`) as `{}` in argument to `{}` (HYB-E1002)",
+                                arg_expr.render(),
+                                arg_kind.label(),
+                                expected.label(),
+                                fn_name
+                            ),
+                            "pass a slice argument matching the parameter type",
+                        );
+                    }
+                }
+            }
+            TypeExpr::Array { elem, .. } => {
+                if let OpKind::Array(inner) = arg_kind {
+                    self.bind_type_params_from_arg(
+                        elem,
+                        inner,
+                        arg_expr,
+                        param_comparable,
+                        subst_kinds,
+                        subst_strs,
+                        fn_name,
+                    );
+                } else {
+                    let expected = self.kind_of_ty_with_subst(param_ty, subst_strs, 0);
+                    if kinds_conflict(&expected, arg_kind) {
+                        self.emit_e1002(
+                            arg_expr.span(),
+                            format!(
+                                "cannot use `{}` (type `{}`) as `{}` in argument to `{}` (HYB-E1002)",
+                                arg_expr.render(),
+                                arg_kind.label(),
+                                expected.label(),
+                                fn_name
+                            ),
+                            "pass an array argument matching the parameter type",
+                        );
+                    }
+                }
+            }
+            TypeExpr::Pointer { to, .. } => {
+                if let OpKind::Pointer(inner) = arg_kind {
+                    self.bind_type_params_from_arg(
+                        to,
+                        inner,
+                        arg_expr,
+                        param_comparable,
+                        subst_kinds,
+                        subst_strs,
+                        fn_name,
+                    );
+                } else {
+                    let expected = self.kind_of_ty_with_subst(param_ty, subst_strs, 0);
+                    if kinds_conflict(&expected, arg_kind) {
+                        self.emit_e1002(
+                            arg_expr.span(),
+                            format!(
+                                "cannot use `{}` (type `{}`) as `{}` in argument to `{}` (HYB-E1002)",
+                                arg_expr.render(),
+                                arg_kind.label(),
+                                expected.label(),
+                                fn_name
+                            ),
+                            "pass a pointer argument matching the parameter type",
+                        );
+                    }
+                }
+            }
+            TypeExpr::Map { key, value, .. } => {
+                if let OpKind::Map(k, v) = arg_kind {
+                    self.bind_type_params_from_arg(
+                        key,
+                        k,
+                        arg_expr,
+                        param_comparable,
+                        subst_kinds,
+                        subst_strs,
+                        fn_name,
+                    );
+                    self.bind_type_params_from_arg(
+                        value,
+                        v,
+                        arg_expr,
+                        param_comparable,
+                        subst_kinds,
+                        subst_strs,
+                        fn_name,
+                    );
+                } else {
+                    let expected = self.kind_of_ty_with_subst(param_ty, subst_strs, 0);
+                    if kinds_conflict(&expected, arg_kind) {
+                        self.emit_e1002(
+                            arg_expr.span(),
+                            format!(
+                                "cannot use `{}` (type `{}`) as `{}` in argument to `{}` (HYB-E1002)",
+                                arg_expr.render(),
+                                arg_kind.label(),
+                                expected.label(),
+                                fn_name
+                            ),
+                            "pass a map argument matching the parameter type",
+                        );
+                    }
+                }
+            }
+            _ => {
+                let expected = self.kind_of_ty_with_subst(param_ty, subst_strs, 0);
+                if kinds_conflict(&expected, arg_kind) {
+                    self.emit_e1002(
+                        arg_expr.span(),
+                        format!(
+                            "cannot use `{}` (type `{}`) as `{}` in argument to `{}` (HYB-E1002)",
+                            arg_expr.render(),
+                            arg_kind.label(),
+                            expected.label(),
+                            fn_name
+                        ),
+                        "pass an argument whose type matches the parameter type",
+                    );
+                }
+            }
         }
     }
 
@@ -4473,6 +5021,131 @@ impl<'a> Checker<'a> {
                 );
             }
         }
+    }
+}
+
+/// Issue #729: compute each declared type parameter's effective `comparable`
+/// status (SPEC G3: explicit `comparable` or inferred when constraint is omitted
+/// and the parameter appears in a map key or `set[T]` element in signature or body).
+fn effective_type_param_map<'t>(
+    type_params: &[hy_syntax::TypeParam],
+    sig_types: impl Iterator<Item = &'t TypeExpr>,
+    body: Option<&Block>,
+) -> HashMap<String, bool> {
+    let param_names: HashSet<&str> = type_params.iter().map(|p| p.name.as_str()).collect();
+    let mut comparable_needed = HashSet::new();
+    for ty in sig_types {
+        collect_comparable_type_params(ty, &param_names, &mut comparable_needed);
+    }
+    if let Some(b) = body {
+        collect_comparable_type_params_in_block(b, &param_names, &mut comparable_needed);
+    }
+    type_params
+        .iter()
+        .map(|p| {
+            let is_comp = match p.constraint.as_deref() {
+                Some("comparable") => true,
+                Some(_) => false,
+                None => comparable_needed.contains(&p.name),
+            };
+            (p.name.clone(), is_comp)
+        })
+        .collect()
+}
+
+fn collect_comparable_type_params_in_block<'a>(
+    b: &'a Block,
+    param_names: &HashSet<&'a str>,
+    out: &mut HashSet<String>,
+) {
+    for s in &b.stmts {
+        collect_comparable_type_params_in_stmt(s, param_names, out);
+    }
+}
+
+fn collect_comparable_type_params_in_stmt<'a>(
+    s: &'a Stmt,
+    param_names: &HashSet<&'a str>,
+    out: &mut HashSet<String>,
+) {
+    match s {
+        Stmt::Local(l) => {
+            if let Some(t) = &l.ty {
+                collect_comparable_type_params(t, param_names, out);
+            }
+            for v in &l.values {
+                collect_comparable_type_params_in_expr(v, param_names, out);
+            }
+        }
+        Stmt::Assign { values, .. } | Stmt::Return { values, .. } => {
+            for v in values {
+                collect_comparable_type_params_in_expr(v, param_names, out);
+            }
+        }
+        Stmt::Expr { expr, .. } | Stmt::Defer { call: expr, .. } => {
+            collect_comparable_type_params_in_expr(expr, param_names, out);
+        }
+        Stmt::Task { args, .. } => {
+            for a in args {
+                collect_comparable_type_params_in_expr(&a.value, param_names, out);
+            }
+        }
+        Stmt::If {
+            init,
+            cond,
+            then,
+            otherwise,
+            ..
+        } => {
+            if let Some(i) = init {
+                collect_comparable_type_params_in_stmt(i, param_names, out);
+            }
+            collect_comparable_type_params_in_expr(cond, param_names, out);
+            collect_comparable_type_params_in_block(then, param_names, out);
+            if let Some(o) = otherwise {
+                collect_comparable_type_params_in_stmt(o, param_names, out);
+            }
+        }
+        Stmt::For { body, .. } | Stmt::Managed { body, .. } => {
+            collect_comparable_type_params_in_block(body, param_names, out);
+        }
+        Stmt::Block { block, .. } => collect_comparable_type_params_in_block(block, param_names, out),
+        _ => {}
+    }
+}
+
+fn collect_comparable_type_params_in_expr<'a>(
+    e: &'a Expr,
+    param_names: &HashSet<&'a str>,
+    out: &mut HashSet<String>,
+) {
+    match e {
+        Expr::MapLit { key, value, .. } => {
+            collect_comparable_type_params(key, param_names, out);
+            collect_comparable_type_params(value, param_names, out);
+        }
+        Expr::StructLit { ty: Some(ty), .. } => {
+            collect_comparable_type_params(ty, param_names, out);
+        }
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident { name, .. } = unwrap_parens(callee) {
+                if name == "make" {
+                    if let Some(first) = args.first() {
+                        if let Expr::Ident { name: tname, .. } = unwrap_parens(&first.value) {
+                            let ty = TypeExpr::Named {
+                                name: tname.clone(),
+                                span: first.value.span(),
+                            };
+                            collect_comparable_type_params(&ty, param_names, out);
+                        }
+                    }
+                }
+            }
+            for a in args {
+                collect_comparable_type_params_in_expr(&a.value, param_names, out);
+            }
+        }
+        _ => {}
     }
 }
 
